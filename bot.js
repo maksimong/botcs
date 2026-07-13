@@ -214,6 +214,7 @@ const HELP_TEXT =
   "/cancel <id> — отменить свою ставку (пока её никто не принял)\n" +
   "/mystats — моя статистика\n" +
   "/top — общий рейтинг всех участников чата\n" +
+  "/badges или /бейджи — список всех бейджей и как их получить\n" +
   "/lineup или /составы — показать составы команд и время начала\n" +
   "/комса — кошелёк админа для расчётов\n\n" +
   "💡 Ставку и принятие чужой ставки можно делать и кнопками под сообщениями бота.\n\n" +
@@ -559,23 +560,21 @@ bot.command("bets", (ctx) => {
   ctx.reply(text.trim(), acceptButtons.length ? Markup.inlineKeyboard(acceptButtons) : undefined);
 });
 
-bot.command("top", (ctx) => {
+// ---------- Лидерборд и бейджи ----------
+
+function getLeaderboard(chatId) {
   const rows = db
     .prepare(
       `SELECT b.* FROM bets b
        JOIN lobbies l ON l.id = b.lobby_id
        WHERE l.chat_id=? AND b.status='settled'`
     )
-    .all(ctx.chat.id);
+    .all(chatId);
 
-  if (rows.length === 0) {
-    return ctx.reply("Пока нет ни одной завершённой ставки — рейтинг пуст.");
-  }
-
-  const stats = new Map(); // userId -> { name, wins, losses, net }
+  const stats = new Map(); // userId -> { id, name, wins, losses, net }
 
   const touch = (id, name) => {
-    if (!stats.has(id)) stats.set(id, { name, wins: 0, losses: 0, net: 0 });
+    if (!stats.has(id)) stats.set(id, { id, name, wins: 0, losses: 0, net: 0 });
     return stats.get(id);
   };
 
@@ -596,12 +595,135 @@ bot.command("top", (ctx) => {
     }
   }
 
-  const sorted = [...stats.values()].sort((a, b) => b.net - a.net);
+  return [...stats.values()].sort((a, b) => b.net - a.net);
+}
+
+// Порядок результатов (побед/поражений) конкретного игрока в хронологии — для стриков
+function getUserResultsOrdered(chatId, userId) {
+  const rows = db
+    .prepare(
+      `SELECT b.* FROM bets b
+       JOIN lobbies l ON l.id = b.lobby_id
+       WHERE l.chat_id=? AND b.status='settled' AND (b.creator_id=? OR b.opponent_id=?)
+       ORDER BY b.id`
+    )
+    .all(chatId, userId, userId);
+
+  return rows.map(
+    (r) =>
+      (r.winner === "creator" && r.creator_id === userId) ||
+      (r.winner === "opponent" && r.opponent_id === userId)
+  );
+}
+
+// Текущая (последняя) серия одинаковых исходов подряд
+function trailingStreak(boolArray) {
+  if (!boolArray.length) return { win: null, len: 0 };
+  const last = boolArray[boolArray.length - 1];
+  let len = 0;
+  for (let i = boolArray.length - 1; i >= 0; i--) {
+    if (boolArray[i] === last) len++;
+    else break;
+  }
+  return { win: last, len };
+}
+
+function getUserMaxBet(chatId, userId) {
+  const row = db
+    .prepare(
+      `SELECT MAX(b.amount) as maxAmt FROM bets b
+       JOIN lobbies l ON l.id = b.lobby_id
+       WHERE l.chat_id=? AND (b.creator_id=? OR b.opponent_id=?) AND b.status!='cancelled'`
+    )
+    .get(chatId, userId, userId);
+  return row && row.maxAmt ? row.maxAmt : 0;
+}
+
+// Суммы всех ставок игрока в хронологии — для бейджа "Мелочёвка"
+function getUserAmountsOrdered(chatId, userId) {
+  return db
+    .prepare(
+      `SELECT b.amount FROM bets b
+       JOIN lobbies l ON l.id = b.lobby_id
+       WHERE l.chat_id=? AND (b.creator_id=? OR b.opponent_id=?) AND b.status!='cancelled'
+       ORDER BY b.id`
+    )
+    .all(chatId, userId, userId)
+    .map((r) => r.amount);
+}
+
+function trailingSmallStreak(amounts, threshold) {
+  let len = 0;
+  for (let i = amounts.length - 1; i >= 0; i--) {
+    if (amounts[i] <= threshold) len++;
+    else break;
+  }
+  return len;
+}
+
+// Возвращает массив бейджей (строк с эмодзи+названием), которые заслужил игрок
+function getUserBadges(chatId, userId) {
+  const badges = [];
+
+  const results = getUserResultsOrdered(chatId, userId);
+  const streak = trailingStreak(results);
+  if (streak.win === true) {
+    if (streak.len >= 5) badges.push("🚀 Неудержимый");
+    else if (streak.len >= 3) badges.push("🔥 На стрике");
+  } else if (streak.win === false) {
+    if (streak.len >= 5) badges.push("⚰️ Дно пробито");
+    else if (streak.len >= 3) badges.push("💀 Чёрная полоса");
+  }
+
+  const maxBet = getUserMaxBet(chatId, userId);
+  if (maxBet >= 1000) badges.push("🎩 Ва-банк");
+  else if (maxBet >= 500) badges.push("🐳 Крупная рыба");
+
+  const amounts = getUserAmountsOrdered(chatId, userId);
+  if (trailingSmallStreak(amounts, 100) >= 5) badges.push("🪙 Мелочёвка");
+
+  const board = getLeaderboard(chatId);
+  if (board.length > 1) {
+    const idx = board.findIndex((s) => s.id === userId);
+    if (idx === 0 && board[0].net > 0) badges.push("👑 Король банка");
+    if (idx === board.length - 1 && board[idx].net < 0) badges.push("🤡 Спонсор чата");
+  }
+  const me = board.find((s) => s.id === userId);
+  if (me && Math.abs(me.net) <= 10 && me.wins + me.losses >= 10) badges.push("⚖️ В нуле");
+
+  return badges;
+}
+
+const BADGES_HELP =
+  "🏅 Бейджи бота\n\n" +
+  "🔥 На стрике — 3+ победы подряд\n" +
+  "🚀 Неудержимый — 5+ побед подряд\n" +
+  "💀 Чёрная полоса — 3+ поражения подряд\n" +
+  "⚰️ Дно пробито — 5+ поражений подряд\n\n" +
+  "🐳 Крупная рыба — хотя бы одна ставка от 500$\n" +
+  "🎩 Ва-банк — хотя бы одна ставка от 1000$\n" +
+  "🪙 Мелочёвка — 5+ последних ставок подряд не крупнее 100$\n\n" +
+  "👑 Король банка — #1 в /top по балансу\n" +
+  "🤡 Спонсор чата — последнее место в /top с отрицательным балансом\n" +
+  "⚖️ В нуле — баланс от -10$ до +10$ при 10+ сыгранных ставках\n\n" +
+  "Бейджи считаются автоматически и видны в /mystats и /top.";
+
+bot.command("badges", (ctx) => ctx.reply(BADGES_HELP));
+bot.hears(/^\/бейджи(?:@\w+)?(?=\s|$)/i, (ctx) => ctx.reply(BADGES_HELP));
+
+bot.command("top", (ctx) => {
+  const sorted = getLeaderboard(ctx.chat.id);
+
+  if (sorted.length === 0) {
+    return ctx.reply("Пока нет ни одной завершённой ставки — рейтинг пуст.");
+  }
 
   const lines = sorted.map((s, i) => {
     const place = ["🥇", "🥈", "🥉"][i] || `${i + 1}.`;
     const sign = s.net >= 0 ? "+" : "";
-    return `${place} ${s.name} — ${s.wins}W/${s.losses}L, баланс: ${sign}${s.net.toFixed(2)}$`;
+    const badges = getUserBadges(ctx.chat.id, s.id);
+    const badgesText = badges.length ? ` ${badges.map((b) => b.split(" ")[0]).join("")}` : "";
+    return `${place} ${s.name}${badgesText} — ${s.wins}W/${s.losses}L, баланс: ${sign}${s.net.toFixed(2)}$`;
   });
 
   ctx.reply(`🏆 Общий рейтинг чата\n\n${lines.join("\n")}`);
@@ -611,9 +733,11 @@ bot.command("mystats", (ctx) => {
   const userId = ctx.from.id;
   const rows = db
     .prepare(
-      `SELECT * FROM bets WHERE status='settled' AND (creator_id=? OR opponent_id=?)`
+      `SELECT b.* FROM bets b
+       JOIN lobbies l ON l.id = b.lobby_id
+       WHERE l.chat_id=? AND b.status='settled' AND (b.creator_id=? OR b.opponent_id=?)`
     )
-    .all(userId, userId);
+    .all(ctx.chat.id, userId, userId);
 
   let wins = 0;
   let losses = 0;
@@ -632,9 +756,13 @@ bot.command("mystats", (ctx) => {
     }
   }
 
+  const badges = getUserBadges(ctx.chat.id, userId);
+  const badgesText = badges.length ? `\n\n🏅 Бейджи:\n${badges.join("\n")}` : "";
+
   ctx.reply(
     `📊 Статистика ${ctx.from.first_name}\n` +
-      `Побед: ${wins}\nПоражений: ${losses}\nБаланс: ${net >= 0 ? "+" : ""}${net.toFixed(2)}$`
+      `Побед: ${wins}\nПоражений: ${losses}\nБаланс: ${net >= 0 ? "+" : ""}${net.toFixed(2)}$` +
+      badgesText
   );
 });
 
