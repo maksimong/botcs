@@ -426,11 +426,11 @@ function showLineup(ctx) {
 }
 
 bot.command("lineup", showLineup);
-bot.hears(/^\/составы(?:@\w+)?\b/i, showLineup);
+bot.hears(/^\/составы(?:@\w+)?(?=\s|$)/i, showLineup);
 
 const ADMIN_WALLET = "TYDpL8JRcAPJuVpimbFrh7LFusJ7bfzWkB";
 
-bot.hears(/^\/комса(?:@\w+)?\b/i, (ctx) => {
+bot.hears(/^\/комса(?:@\w+)?(?=\s|$)/i, (ctx) => {
   ctx.reply(`💳 Кошелёк для расчётов:\n\`${ADMIN_WALLET}\``, { parse_mode: "Markdown" });
 });
 
