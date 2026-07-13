@@ -11,7 +11,7 @@
  */
 
 require("dotenv").config();
-const { Telegraf } = require("telegraf");
+const { Telegraf, Markup } = require("telegraf");
 const Database = require("better-sqlite3");
 const path = require("path");
 
@@ -74,7 +74,61 @@ db.exec(`
   );
 `);
 
-// ---------- Помощники ----------
+// ---------- Общая логика ставок (используется и командами, и кнопками) ----------
+
+const QUICK_AMOUNTS = [50, 100, 200, 500];
+
+function quickBetKeyboard() {
+  return Markup.inlineKeyboard(
+    QUICK_AMOUNTS.map((a) => Markup.button.callback(`${a}$`, `quickbet:${a}`))
+  );
+}
+
+function acceptKeyboard(betId) {
+  return Markup.inlineKeyboard([
+    Markup.button.callback("🤝 Принять ставку", `accept:${betId}`),
+  ]);
+}
+
+// Создаёт ставку в БД. Возвращает {ok:true, betId, amount} или {ok:false, error}.
+function createBet(chatId, userId, userName, amount) {
+  const lobby = getActiveLobby(chatId);
+  if (!lobby) return { ok: false, error: "Сейчас нет открытого лобби для ставок." };
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return { ok: false, error: "Сумма должна быть положительным числом." };
+  }
+
+  const info = db
+    .prepare(
+      `INSERT INTO bets (lobby_id, creator_id, creator_name, amount, status, created_at)
+       VALUES (?,?,?,?,?,?)`
+    )
+    .run(lobby.id, userId, userName, amount, "open", nowIso());
+
+  return { ok: true, betId: info.lastInsertRowid, amount };
+}
+
+// Принимает ставку. Возвращает {ok:true, bet, text} или {ok:false, error}.
+function acceptBet(betId, userId, userName) {
+  const bet = db.prepare("SELECT * FROM bets WHERE id=?").get(betId);
+  if (!bet) return { ok: false, error: "Ставка не найдена." };
+  if (bet.status !== "open") return { ok: false, error: "Эта ставка уже недоступна для принятия." };
+  if (bet.creator_id === userId) return { ok: false, error: "Нельзя принять собственную ставку." };
+
+  db.prepare(
+    `UPDATE bets SET status='matched', opponent_id=?, opponent_name=?, matched_at=? WHERE id=?`
+  ).run(userId, userName, nowIso(), betId);
+
+  const text = `🤝 Ставка #${betId} принята! ${bet.creator_name} vs ${userName}, ${bet.amount.toFixed(
+    2
+  )}$ на кону.`;
+
+  return { ok: true, bet, text };
+}
+
+function userDisplayName(from) {
+  return from.first_name || from.username || "Игрок";
+}
 
 function nowIso() {
   return new Date().toISOString().slice(0, 19);
@@ -157,8 +211,12 @@ const HELP_TEXT =
   "/bet <сумма> — поставить сумму на себя (можно ставить сколько угодно раз)\n" +
   "/bets — список ставок в текущем лобби\n" +
   "/accept <id> — принять чужую ставку\n" +
+  "/cancel <id> — отменить свою ставку (пока её никто не принял)\n" +
   "/mystats — моя статистика\n" +
-  "/lineup или /составы — показать составы команд и время начала\n\n" +
+  "/top — общий рейтинг всех участников чата\n" +
+  "/lineup или /составы — показать составы команд и время начала\n" +
+  "/комса — кошелёк админа для расчётов\n\n" +
+  "💡 Ставку и принятие чужой ставки можно делать и кнопками под сообщениями бота.\n\n" +
   "Для админов:\n" +
   "/create_lobby — открыть приём ставок\n" +
   "/close_lobby — закрыть приём ставок\n" +
@@ -202,7 +260,11 @@ bot.command("create_lobby", async (ctx) => {
   );
 
   // Публичное объявление для всех — без деталей, просто что приём ставок открыт
-  await ctx.telegram.sendMessage(ctx.chat.id, `✅ Приём ставок открыт!\nСтавьте командой /bet <сумма>`);
+  await ctx.telegram.sendMessage(
+    ctx.chat.id,
+    `✅ Приём ставок открыт!\nСтавьте командой /bet <сумма> или кнопкой ниже:`,
+    quickBetKeyboard()
+  );
 });
 
 bot.command("close_lobby", async (ctx) => {
@@ -366,34 +428,87 @@ function showLineup(ctx) {
 bot.command("lineup", showLineup);
 bot.hears(/^\/составы(?:@\w+)?\b/i, showLineup);
 
+const ADMIN_WALLET = "TYDpL8JRcAPJuVpimbFrh7LFusJ7bfzWkB";
+
+bot.hears(/^\/комса(?:@\w+)?\b/i, (ctx) => {
+  ctx.reply(`💳 Кошелёк для расчётов:\n\`${ADMIN_WALLET}\``, { parse_mode: "Markdown" });
+});
+
+// --- Обработчики инлайн-кнопок ---
+
+bot.action(/^quickbet:(\d+)$/, async (ctx) => {
+  const amount = Number(ctx.match[1]);
+  const result = createBet(ctx.chat.id, ctx.from.id, userDisplayName(ctx.from), amount);
+
+  if (!result.ok) {
+    return ctx.answerCbQuery(result.error, { show_alert: true });
+  }
+
+  await ctx.answerCbQuery(`Ставка ${amount}$ создана ✅`);
+  await ctx.reply(
+    `💰 Ставка #${result.betId} создана: ${ctx.from.first_name} ставит ${amount.toFixed(2)}$ на себя.`,
+    acceptKeyboard(result.betId)
+  );
+});
+
+bot.action(/^accept:(\d+)$/, async (ctx) => {
+  const betId = Number(ctx.match[1]);
+  const result = acceptBet(betId, ctx.from.id, userDisplayName(ctx.from));
+
+  if (!result.ok) {
+    return ctx.answerCbQuery(result.error, { show_alert: true });
+  }
+
+  await ctx.answerCbQuery("Ставка принята! 🤝");
+  try {
+    // Убираем кнопку и обновляем текст исходного сообщения о ставке
+    await ctx.editMessageText(result.text);
+  } catch (e) {
+    // если не удалось отредактировать (например, сообщение слишком старое) —
+    // просто отправляем новое
+    await ctx.reply(result.text);
+  }
+});
+
 // --- Пользователи: ставки ---
 
 bot.command("bet", (ctx) => {
-  const lobby = getActiveLobby(ctx.chat.id);
-  if (!lobby) {
-    return ctx.reply("Сейчас нет открытого лобби для ставок. Ждите /create_lobby от админа.");
-  }
-
   const parts = ctx.message.text.split(/\s+/);
   if (parts.length < 2) return ctx.reply("Использование: /bet 100");
 
   const amount = parseFloat(parts[1].replace(",", "."));
-  if (!Number.isFinite(amount) || amount <= 0) {
-    return ctx.reply("Сумма должна быть положительным числом. Пример: /bet 100");
+  const result = createBet(ctx.chat.id, ctx.from.id, userDisplayName(ctx.from), amount);
+
+  if (!result.ok) return ctx.reply(result.error + " Пример: /bet 100");
+
+  ctx.reply(
+    `💰 Ставка #${result.betId} создана: ${ctx.from.first_name} ставит ${amount.toFixed(2)}$ на себя.`,
+    acceptKeyboard(result.betId)
+  );
+});
+
+bot.command("cancel", (ctx) => {
+  const args = ctx.message.text.split(/\s+/);
+  if (args.length !== 2 || !/^\d+$/.test(args[1])) {
+    return ctx.reply("Использование: /cancel <bet_id>");
   }
 
-  const info = db
-    .prepare(
-      `INSERT INTO bets (lobby_id, creator_id, creator_name, amount, status, created_at)
-       VALUES (?,?,?,?,?,?)`
-    )
-    .run(lobby.id, ctx.from.id, ctx.from.first_name || ctx.from.username || "Игрок", amount, "open", nowIso());
+  const betId = Number(args[1]);
+  const bet = db.prepare("SELECT * FROM bets WHERE id=?").get(betId);
 
-  const betId = info.lastInsertRowid;
-  ctx.reply(
-    `💰 Ставка #${betId} создана: ${ctx.from.first_name} ставит ${amount.toFixed(2)}$ \n` +
-      `Кто-то может принять её командой /accept ${betId} (тоже ставя ${amount.toFixed(2)}$ ).`
-  );
+  if (!bet) return ctx.reply("Ставка не найдена.");
+  if (bet.creator_id !== ctx.from.id) {
+    return ctx.reply("Отменить можно только свою собственную ставку.");
+  }
+  if (bet.status !== "open") {
+    return ctx.reply(
+      "Эту ставку уже нельзя отменить самому — она либо принята соперником, либо уже завершена. " +
+        "Если нужно отменить принятую ставку — обратитесь к админу."
+    );
+  }
+
+  db.prepare("UPDATE bets SET status='cancelled' WHERE id=?").run(betId);
+  ctx.reply(`🗑 Ваша ставка #${betId} отменена.`);
 });
 
 bot.command("accept", (ctx) => {
@@ -403,21 +518,10 @@ bot.command("accept", (ctx) => {
   }
 
   const betId = Number(args[1]);
-  const bet = db.prepare("SELECT * FROM bets WHERE id=?").get(betId);
+  const result = acceptBet(betId, ctx.from.id, userDisplayName(ctx.from));
 
-  if (!bet) return ctx.reply("Ставка не найдена.");
-  if (bet.status !== "open") return ctx.reply("Эта ставка уже недоступна для принятия.");
-  if (bet.creator_id === ctx.from.id) return ctx.reply("Нельзя принять собственную ставку.");
-
-  db.prepare(
-    `UPDATE bets SET status='matched', opponent_id=?, opponent_name=?, matched_at=? WHERE id=?`
-  ).run(ctx.from.id, ctx.from.first_name || ctx.from.username || "Игрок", nowIso(), betId);
-
-  ctx.reply(
-    `🤝 Ставка #${betId} принята! ${bet.creator_name} vs ${ctx.from.first_name}, ${bet.amount.toFixed(
-      2
-    )}$ на кону.`
-  );
+  if (!result.ok) return ctx.reply(result.error);
+  ctx.reply(result.text);
 });
 
 bot.command("bets", (ctx) => {
@@ -447,7 +551,60 @@ bot.command("bets", (ctx) => {
   if (matchedBets.length) text += "🔵 Активные ставки:\n" + matchedBets.map(fmtBet).join("\n") + "\n\n";
   if (settledBets.length) text += "✅ Завершённые:\n" + settledBets.map(fmtBet).join("\n");
 
-  ctx.reply(text.trim());
+  // Кнопки принятия — только для чужих открытых ставок
+  const acceptButtons = openBets
+    .filter((b) => b.creator_id !== ctx.from.id)
+    .map((b) => [Markup.button.callback(`Принять #${b.id} (${b.amount.toFixed(0)}$)`, `accept:${b.id}`)]);
+
+  ctx.reply(text.trim(), acceptButtons.length ? Markup.inlineKeyboard(acceptButtons) : undefined);
+});
+
+bot.command("top", (ctx) => {
+  const rows = db
+    .prepare(
+      `SELECT b.* FROM bets b
+       JOIN lobbies l ON l.id = b.lobby_id
+       WHERE l.chat_id=? AND b.status='settled'`
+    )
+    .all(ctx.chat.id);
+
+  if (rows.length === 0) {
+    return ctx.reply("Пока нет ни одной завершённой ставки — рейтинг пуст.");
+  }
+
+  const stats = new Map(); // userId -> { name, wins, losses, net }
+
+  const touch = (id, name) => {
+    if (!stats.has(id)) stats.set(id, { name, wins: 0, losses: 0, net: 0 });
+    return stats.get(id);
+  };
+
+  for (const r of rows) {
+    const creator = touch(r.creator_id, r.creator_name);
+    const opponent = touch(r.opponent_id, r.opponent_name);
+
+    if (r.winner === "creator") {
+      creator.wins += 1;
+      creator.net += r.amount;
+      opponent.losses += 1;
+      opponent.net -= r.amount;
+    } else {
+      opponent.wins += 1;
+      opponent.net += r.amount;
+      creator.losses += 1;
+      creator.net -= r.amount;
+    }
+  }
+
+  const sorted = [...stats.values()].sort((a, b) => b.net - a.net);
+
+  const lines = sorted.map((s, i) => {
+    const place = ["🥇", "🥈", "🥉"][i] || `${i + 1}.`;
+    const sign = s.net >= 0 ? "+" : "";
+    return `${place} ${s.name} — ${s.wins}W/${s.losses}L, баланс: ${sign}${s.net.toFixed(2)}$`;
+  });
+
+  ctx.reply(`🏆 Общий рейтинг чата\n\n${lines.join("\n")}`);
 });
 
 bot.command("mystats", (ctx) => {
