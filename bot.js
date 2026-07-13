@@ -128,7 +128,7 @@ function fmtBet(b) {
   if (b.status === "matched") {
     return `#${b.id} — ${b.creator_name} vs ${b.opponent_name}: ${b.amount.toFixed(
       2
-    )}$ каждый [матч]`;
+    )}$ каждый `;
   }
   if (b.status === "settled") {
     const winnerName = b.winner === "creator" ? b.creator_name : b.opponent_name;
@@ -207,7 +207,7 @@ bot.command("create_lobby", async (ctx) => {
   // Публичное объявление для всех — без деталей, просто что приём ставок открыт
   await ctx.telegram.sendMessage(
     ctx.chat.id,
-    `🎮 Приём ставок открыт: ${title}\nСтавьте командой /bet <сумма>`
+    `✅ Приём ставок открыт: ${title}\nСтавьте командой /bet <сумма>`
   );
 });
 
@@ -397,8 +397,8 @@ bot.command("bet", (ctx) => {
 
   const betId = info.lastInsertRowid;
   ctx.reply(
-    `💰 Ставка #${betId} создана: ${ctx.from.first_name} ставит ${amount.toFixed(2)}$ на себя.\n` +
-      `Кто-то может принять её командой /accept ${betId} (тоже ставя ${amount.toFixed(2)}$ на себя).`
+    `💰 Ставка #${betId} создана: ${ctx.from.first_name} ставит ${amount.toFixed(2)}$ \n` +
+      `Кто-то может принять её командой /accept ${betId} (тоже ставя ${amount.toFixed(2)}$ ).`
   );
 });
 
