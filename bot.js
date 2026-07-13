@@ -183,7 +183,7 @@ bot.command("create_lobby", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может создавать лобби.");
 
   const title = ctx.message.text.split(" ").slice(1).join(" ").trim();
-  if (!title) return replyPrivately(ctx, "Использование: /create_lobby Navi vs Vitality");
+  if (!title) return replyPrivately(ctx, "Использование: /create_lobby ");
 
   const existing = getActiveLobby(ctx.chat.id);
   if (existing) {
@@ -201,13 +201,13 @@ bot.command("create_lobby", async (ctx) => {
 
   await replyPrivately(
     ctx,
-    `✅ Лобби #${info.lastInsertRowid} открыто: ${title}\nПишите /bet <сумма>, например: /bet 100`
+    `✅ Лобби #${info.lastInsertRowid} открыто: \nПишите /bet <сумма>, например: /bet 100`
   );
 
   // Публичное объявление для всех — без деталей, просто что приём ставок открыт
   await ctx.telegram.sendMessage(
     ctx.chat.id,
-    `✅ Приём ставок открыт: ${title}\nСтавьте командой /bet <сумма>`
+    `✅ Приём ставок открыт \nСтавьте командой /bet <сумма>`
   );
 });
 
@@ -224,11 +224,11 @@ bot.command("close_lobby", async (ctx) => {
 
   await replyPrivately(
     ctx,
-    `🔒 Лобби #${lobby.id} (${lobby.title}) закрыто.\n` +
+    `🔒 Лобби #${lobby.id} закрыто.\n` +
       `Не забудьте зафиксировать результаты: /result <bet_id> creator|opponent`
   );
 
-  await ctx.telegram.sendMessage(ctx.chat.id, `🔒 Приём ставок закрыт: ${lobby.title}`);
+  await ctx.telegram.sendMessage(ctx.chat.id, `🔒 Приём ставок закрыт `);
 });
 
 bot.command("del_bet", async (ctx) => {
