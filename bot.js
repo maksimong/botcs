@@ -450,7 +450,7 @@ bot.command("bets", (ctx) => {
 
   let text = header;
   if (openBets.length) text += "🟢 Открытые ставки:\n" + openBets.map(fmtBet).join("\n") + "\n\n";
-  if (matchedBets.length) text += "🔵 Активные матчи:\n" + matchedBets.map(fmtBet).join("\n") + "\n\n";
+  if (matchedBets.length) text += "🔵 Активные ставки:\n" + matchedBets.map(fmtBet).join("\n") + "\n\n";
   if (settledBets.length) text += "✅ Завершённые:\n" + settledBets.map(fmtBet).join("\n");
 
   ctx.reply(text.trim());
