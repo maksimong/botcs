@@ -10,6 +10,7 @@
  * Хранилище: SQLite-файл bets.db в этой же папке (создаётся автоматически).
  */
 
+require("dotenv").config();
 const { Telegraf } = require("telegraf");
 const Database = require("better-sqlite3");
 const path = require("path");
@@ -83,6 +84,29 @@ function isAdmin(userId) {
   return ADMIN_IDS.has(userId);
 }
 
+// Приватный ответ админу: удаляет команду админа из группового чата (если у бота
+// есть права на удаление) и отправляет подробный ответ в личку. Если бот не может
+// написать в личку (админ ни разу не жал /start боту) — отвечает в группе как раньше,
+// с пояснением, что нужно сделать, чтобы ответы приходили приватно.
+async function replyPrivately(ctx, text, extra) {
+  try {
+    await ctx.deleteMessage();
+  } catch (e) {
+    // бот не админ группы или не может удалить сообщение — не критично, продолжаем
+  }
+
+  try {
+    await ctx.telegram.sendMessage(ctx.from.id, text, extra);
+  } catch (e) {
+    await ctx.reply(
+      text +
+        "\n\n⚠️ Не удалось написать вам в личку — откройте диалог с ботом и нажмите /start, " +
+        "тогда ответы на админ-команды будут приходить приватно.",
+      extra
+    );
+  }
+}
+
 function getActiveLobby(chatId) {
   return db
     .prepare(
@@ -142,6 +166,9 @@ const HELP_TEXT =
   "/del_bet <id> — удалить ставку\n" +
   "/export — выгрузить CSV с историей\n" +
   "/set_lineup — назначить составы команд и время начала (см. шаблон ниже)\n\n" +
+  "ℹ️ Ответы на эти команды и сама команда приходят вам приватно и удаляются из группы " +
+  "(нужно один раз нажать /start боту в личке и дать боту права админа группы " +
+  "на удаление сообщений).\n\n" +
   LINEUP_TEMPLATE;
 
 // ---------- Бот ----------
@@ -152,15 +179,16 @@ bot.command(["help", "start"], (ctx) => ctx.reply(HELP_TEXT));
 
 // --- Админ: лобби ---
 
-bot.command("create_lobby", (ctx) => {
+bot.command("create_lobby", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может создавать лобби.");
 
   const title = ctx.message.text.split(" ").slice(1).join(" ").trim();
-  if (!title) return ctx.reply("Использование: /create_lobby Navi vs Vitality");
+  if (!title) return replyPrivately(ctx, "Использование: /create_lobby Navi vs Vitality");
 
   const existing = getActiveLobby(ctx.chat.id);
   if (existing) {
-    return ctx.reply(
+    return replyPrivately(
+      ctx,
       `Уже есть открытое лобби #${existing.id} (${existing.title}). Сначала закройте его: /close_lobby`
     );
   }
@@ -171,51 +199,61 @@ bot.command("create_lobby", (ctx) => {
     )
     .run(ctx.chat.id, title, "open", ctx.from.id, nowIso());
 
-  ctx.reply(
-    `✅ Лобби #${info.lastInsertRowid} открыто: ${title}\n` +
-      `Пишите /bet <сумма>, например: /bet 100`
+  await replyPrivately(
+    ctx,
+    `✅ Лобби #${info.lastInsertRowid} открыто: ${title}\nПишите /bet <сумма>, например: /bet 100`
+  );
+
+  // Публичное объявление для всех — без деталей, просто что приём ставок открыт
+  await ctx.telegram.sendMessage(
+    ctx.chat.id,
+    `🎮 Приём ставок открыт: ${title}\nСтавьте командой /bet <сумма>`
   );
 });
 
-bot.command("close_lobby", (ctx) => {
+bot.command("close_lobby", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может закрывать лобби.");
 
   const lobby = getActiveLobby(ctx.chat.id);
-  if (!lobby) return ctx.reply("Нет открытого лобби.");
+  if (!lobby) return replyPrivately(ctx, "Нет открытого лобби.");
 
   db.prepare("UPDATE lobbies SET status='closed', closed_at=? WHERE id=?").run(
     nowIso(),
     lobby.id
   );
 
-  ctx.reply(
+  await replyPrivately(
+    ctx,
     `🔒 Лобби #${lobby.id} (${lobby.title}) закрыто.\n` +
       `Не забудьте зафиксировать результаты: /result <bet_id> creator|opponent`
   );
+
+  await ctx.telegram.sendMessage(ctx.chat.id, `🔒 Приём ставок закрыт: ${lobby.title}`);
 });
 
-bot.command("del_bet", (ctx) => {
+bot.command("del_bet", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может удалять ставки.");
 
   const args = ctx.message.text.split(/\s+/);
   if (args.length !== 2 || !/^\d+$/.test(args[1])) {
-    return ctx.reply("Использование: /del_bet <id>");
+    return replyPrivately(ctx, "Использование: /del_bet <id>");
   }
 
   const betId = Number(args[1]);
   const bet = db.prepare("SELECT * FROM bets WHERE id=?").get(betId);
-  if (!bet) return ctx.reply("Ставка не найдена.");
+  if (!bet) return replyPrivately(ctx, "Ставка не найдена.");
 
   db.prepare("UPDATE bets SET status='cancelled' WHERE id=?").run(betId);
-  ctx.reply(`🗑 Ставка #${betId} удалена (отменена).`);
+  await replyPrivately(ctx, `🗑 Ставка #${betId} удалена (отменена).`);
 });
 
-bot.command("result", (ctx) => {
+bot.command("result", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может фиксировать результат.");
 
   const args = ctx.message.text.split(/\s+/);
   if (args.length !== 3 || !/^\d+$/.test(args[1]) || !["creator", "opponent"].includes(args[2])) {
-    return ctx.reply(
+    return replyPrivately(
+      ctx,
       "Использование: /result <bet_id> creator|opponent\n" +
         "(creator — выиграл тот, кто создал ставку; opponent — тот, кто её принял)"
     );
@@ -225,15 +263,15 @@ bot.command("result", (ctx) => {
   const winner = args[2];
 
   const bet = db.prepare("SELECT * FROM bets WHERE id=?").get(betId);
-  if (!bet) return ctx.reply("Ставка не найдена.");
+  if (!bet) return replyPrivately(ctx, "Ставка не найдена.");
   if (bet.status !== "matched") {
-    return ctx.reply("Результат можно зафиксировать только для сматченной ставки.");
+    return replyPrivately(ctx, "Результат можно зафиксировать только для сматченной ставки.");
   }
 
   db.prepare("UPDATE bets SET status='settled', winner=? WHERE id=?").run(winner, betId);
 
   const winnerName = winner === "creator" ? bet.creator_name : bet.opponent_name;
-  ctx.reply(`✅ Ставка #${betId} завершена. Победитель: ${winnerName}`);
+  await replyPrivately(ctx, `✅ Ставка #${betId} завершена. Победитель: ${winnerName}`);
 });
 
 bot.command("export", async (ctx) => {
@@ -269,26 +307,39 @@ bot.command("export", async (ctx) => {
 
   const csv = "\uFEFF" + header + body; // BOM для корректной кириллицы в Excel
 
-  await ctx.replyWithDocument({
-    source: Buffer.from(csv, "utf-8"),
-    filename: "bets_history.csv",
-  });
+  try {
+    await ctx.deleteMessage();
+  } catch (e) {
+    // не критично, если не получилось
+  }
+
+  try {
+    await ctx.telegram.sendDocument(ctx.from.id, {
+      source: Buffer.from(csv, "utf-8"),
+      filename: "bets_history.csv",
+    });
+  } catch (e) {
+    await ctx.replyWithDocument(
+      { source: Buffer.from(csv, "utf-8"), filename: "bets_history.csv" },
+      { caption: "⚠️ Не смог отправить в личку — откройте диалог с ботом и нажмите /start." }
+    );
+  }
 });
 
 // --- Админ: составы ---
 
-bot.command("set_lineup", (ctx) => {
+bot.command("set_lineup", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может назначать составы.");
 
   const lines = ctx.message.text.split("\n");
-  if (lines.length < 12) return ctx.reply(LINEUP_TEMPLATE);
+  if (lines.length < 12) return replyPrivately(ctx, LINEUP_TEMPLATE);
 
   const matchTime = lines[1].trim();
   const team1 = lines.slice(2, 7).map((l) => l.trim());
   const team2 = lines.slice(7, 12).map((l) => l.trim());
 
   if (!matchTime || team1.some((n) => !n) || team2.some((n) => !n)) {
-    return ctx.reply("Время и все 10 ников должны быть заполнены.\n\n" + LINEUP_TEMPLATE);
+    return replyPrivately(ctx, "Время и все 10 ников должны быть заполнены.\n\n" + LINEUP_TEMPLATE);
   }
 
   db.prepare(
@@ -296,7 +347,7 @@ bot.command("set_lineup", (ctx) => {
      VALUES (?,?,?,?,?,?)`
   ).run(ctx.chat.id, matchTime, team1.join("\n"), team2.join("\n"), ctx.from.id, nowIso());
 
-  ctx.reply("✅ Составы обновлены. Посмотреть: /lineup или /составы");
+  await replyPrivately(ctx, "✅ Составы обновлены. Посмотреть: /lineup или /составы");
 });
 
 // Показ составов: /lineup работает как обычная команда, а /составы (кириллица)
