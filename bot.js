@@ -160,7 +160,7 @@ const HELP_TEXT =
   "/mystats — моя статистика\n" +
   "/lineup или /составы — показать составы команд и время начала\n\n" +
   "Для админов:\n" +
-  "/create_lobby <название> — открыть приём ставок\n" +
+  "/create_lobby — открыть приём ставок\n" +
   "/close_lobby — закрыть приём ставок\n" +
   "/result <id> creator|opponent — зафиксировать победителя\n" +
   "/del_bet <id> — удалить ставку\n" +
@@ -182,14 +182,11 @@ bot.command(["help", "start"], (ctx) => ctx.reply(HELP_TEXT));
 bot.command("create_lobby", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может создавать лобби.");
 
-  const title = ctx.message.text.split(" ").slice(1).join(" ").trim();
-  if (!title) return replyPrivately(ctx, "Использование: /create_lobby ");
-
   const existing = getActiveLobby(ctx.chat.id);
   if (existing) {
     return replyPrivately(
       ctx,
-      `Уже есть открытое лобби #${existing.id} (${existing.title}). Сначала закройте его: /close_lobby`
+      `Уже есть открытое лобби #${existing.id}. Сначала закройте его: /close_lobby`
     );
   }
 
@@ -197,18 +194,15 @@ bot.command("create_lobby", async (ctx) => {
     .prepare(
       "INSERT INTO lobbies (chat_id, title, status, created_by, created_at) VALUES (?,?,?,?,?)"
     )
-    .run(ctx.chat.id, title, "open", ctx.from.id, nowIso());
+    .run(ctx.chat.id, "", "open", ctx.from.id, nowIso());
 
   await replyPrivately(
     ctx,
-    `✅ Лобби #${info.lastInsertRowid} открыто: \nПишите /bet <сумма>, например: /bet 100`
+    `✅ Лобби #${info.lastInsertRowid} открыто.\nПишите /bet <сумма>, например: /bet 100`
   );
 
   // Публичное объявление для всех — без деталей, просто что приём ставок открыт
-  await ctx.telegram.sendMessage(
-    ctx.chat.id,
-    `✅ Приём ставок открыт \nСтавьте командой /bet <сумма>`
-  );
+  await ctx.telegram.sendMessage(ctx.chat.id, `✅ Приём ставок открыт!\nСтавьте командой /bet <сумма>`);
 });
 
 bot.command("close_lobby", async (ctx) => {
@@ -228,7 +222,7 @@ bot.command("close_lobby", async (ctx) => {
       `Не забудьте зафиксировать результаты: /result <bet_id> creator|opponent`
   );
 
-  await ctx.telegram.sendMessage(ctx.chat.id, `🔒 Приём ставок закрыт `);
+  await ctx.telegram.sendMessage(ctx.chat.id, `🔒 Приём ставок закрыт!`);
 });
 
 bot.command("del_bet", async (ctx) => {
@@ -279,19 +273,19 @@ bot.command("export", async (ctx) => {
 
   const rows = db
     .prepare(
-      `SELECT b.*, l.title as lobby_title FROM bets b
+      `SELECT b.* FROM bets b
        JOIN lobbies l ON l.id = b.lobby_id
        WHERE l.chat_id=? ORDER BY b.id`
     )
     .all(ctx.chat.id);
 
-  const header = "bet_id,lobby,creator,opponent,amount,status,winner,created_at,matched_at\n";
+  const header = "bet_id,lobby_id,creator,opponent,amount,status,winner,created_at,matched_at\n";
   const csvEscape = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
   const body = rows
     .map((r) =>
       [
         r.id,
-        r.lobby_title,
+        r.lobby_id,
         r.creator_name,
         r.opponent_name,
         r.amount,
@@ -432,14 +426,14 @@ bot.command("bets", (ctx) => {
 
   if (lobby) {
     rows = db.prepare("SELECT * FROM bets WHERE lobby_id=? ORDER BY id").all(lobby.id);
-    header = `📋 Лобби #${lobby.id} (${lobby.title})\n\n`;
+    header = `📋 Лобби #${lobby.id}\n\n`;
   } else {
     const last = db
       .prepare("SELECT * FROM lobbies WHERE chat_id=? ORDER BY id DESC LIMIT 1")
       .get(ctx.chat.id);
     if (!last) return ctx.reply("Пока нет ни одного лобби.");
     rows = db.prepare("SELECT * FROM bets WHERE lobby_id=? ORDER BY id").all(last.id);
-    header = `📋 Лобби #${last.id} (${last.title}) — закрыто\n\n`;
+    header = `📋 Лобби #${last.id} — закрыто\n\n`;
   }
 
   if (rows.length === 0) return ctx.reply(header + "Ставок пока нет.");
