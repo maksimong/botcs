@@ -74,10 +74,20 @@ db.exec(`
   );
 `);
 
+// Миграция: добавляем колонку для id закреплённого сообщения с кнопками ставок.
+// В try/catch — чтобы не падать, если колонка уже была добавлена раньше.
+try {
+  db.exec("ALTER TABLE lobbies ADD COLUMN pinned_message_id INTEGER");
+} catch (e) {
+  // колонка уже существует — это нормально
+}
+
 // ---------- Общая логика ставок (используется и командами, и кнопками) ----------
 
 const QUICK_AMOUNTS = [50, 100, 200, 500];
 
+// Inline-кнопки (не занимают поле ввода и не видны тем, кто их не трогает —
+// в отличие от reply-клавиатуры, которая одна на весь чат для всех участников).
 function quickBetKeyboard() {
   return Markup.inlineKeyboard(
     QUICK_AMOUNTS.map((a) => Markup.button.callback(`${a}$`, `quickbet:${a}`))
@@ -217,7 +227,8 @@ const HELP_TEXT =
   "/badges или /бейджи — список всех бейджей и как их получить\n" +
   "/lineup или /составы — показать составы команд и время начала\n" +
   "/комса — кошелёк админа для расчётов\n\n" +
-  "💡 Ставку и принятие чужой ставки можно делать и кнопками под сообщениями бота.\n\n" +
+  "💡 Пока лобби открыто, кнопки быстрой ставки 50$/100$/200$/500$ есть в закреплённом " +
+  "сообщении наверху чата, а принять чужую ставку можно кнопкой под сообщением о ней.\n\n" +
   "Для админов:\n" +
   "/create_lobby — открыть приём ставок\n" +
   "/close_lobby — закрыть приём ставок\n" +
@@ -261,11 +272,25 @@ bot.command("create_lobby", async (ctx) => {
   );
 
   // Публичное объявление для всех — без деталей, просто что приём ставок открыт
-  await ctx.telegram.sendMessage(
+  const announcement = await ctx.telegram.sendMessage(
     ctx.chat.id,
-    `✅ Приём ставок открыт!\nСтавьте командой /bet <сумма> или кнопкой ниже:`,
+    `✅ Приём ставок открыт!\nСтавьте командой /bet <сумма> или кнопками ниже 👇`,
     quickBetKeyboard()
   );
+
+  // Закрепляем сообщение, чтобы кнопки было легко найти даже после того, как чат
+  // уйдёт далеко вперёд. Если у бота нет прав на закрепление — просто пропускаем.
+  try {
+    await ctx.telegram.pinChatMessage(ctx.chat.id, announcement.message_id, {
+      disable_notification: true,
+    });
+    db.prepare("UPDATE lobbies SET pinned_message_id=? WHERE id=?").run(
+      announcement.message_id,
+      info.lastInsertRowid
+    );
+  } catch (e) {
+    // бот не админ группы или права на закрепление не выданы — не критично
+  }
 });
 
 bot.command("close_lobby", async (ctx) => {
@@ -284,6 +309,15 @@ bot.command("close_lobby", async (ctx) => {
     `🔒 Лобби #${lobby.id} закрыто.\n` +
       `Не забудьте зафиксировать результаты: /result <bet_id> creator|opponent`
   );
+
+  // Открепляем сообщение с кнопками ставок, если оно было закреплено
+  if (lobby.pinned_message_id) {
+    try {
+      await ctx.telegram.unpinChatMessage(ctx.chat.id, { message_id: lobby.pinned_message_id });
+    } catch (e) {
+      // не критично, если не получилось
+    }
+  }
 
   await ctx.telegram.sendMessage(ctx.chat.id, `🔒 Приём ставок закрыт!`);
 });
