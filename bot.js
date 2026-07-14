@@ -72,6 +72,38 @@ db.exec(`
     created_by INTEGER,
     created_at TEXT
   );
+
+  -- Telegram Bot API не даёт получить список всех участников группы напрямую
+  -- (ограничение приватности) — поэтому запоминаем каждого, кто хоть раз
+  -- написал боту любую команду. Используется для /all.
+  CREATE TABLE IF NOT EXISTS known_users (
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    name TEXT,
+    PRIMARY KEY (chat_id, user_id)
+  );
+
+  -- Список юзернеймов, которые админ задал вручную для тега всех (/all).
+  -- Работает надёжнее, чем known_users, но требует, чтобы у людей был @username.
+  CREATE TABLE IF NOT EXISTS tag_lists (
+    chat_id INTEGER PRIMARY KEY,
+    usernames TEXT, -- юзернеймы через перенос строки, без символа @
+    updated_at TEXT
+  );
+
+  -- Комиссия админу: 5% с выигрыша, начисляется автоматически при фиксации
+  -- результата ставки. paid=0 — долг ещё не оплачен, paid=1 — закрыт.
+  CREATE TABLE IF NOT EXISTS commissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    bet_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    user_name TEXT,
+    amount REAL NOT NULL,
+    paid INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT,
+    paid_at TEXT
+  );
 `);
 
 // Миграция: добавляем колонку для id закреплённого сообщения с кнопками ставок.
@@ -85,6 +117,10 @@ try {
 // ---------- Общая логика ставок (используется и командами, и кнопками) ----------
 
 const QUICK_AMOUNTS = [50, 100, 200, 500];
+
+// Комиссия админу с каждого выигрыша. Легко поменять на другой процент — например,
+// на 0.1 для 10%.
+const COMMISSION_RATE = 0.05;
 
 // Inline-кнопки (не занимают поле ввода и не видны тем, кто их не трогает —
 // в отличие от reply-клавиатуры, которая одна на весь чат для всех участников).
@@ -221,9 +257,10 @@ const HELP_TEXT =
   "/bet <сумма> или /ставка <сумма> — поставить сумму на себя (можно ставить сколько угодно раз)\n" +
   "/bets или /ставки — список ставок в текущем лобби\n" +
   "/accept <id> — принять чужую ставку\n" +
-  "/cancel <id> — отменить свою ставку (пока её никто не принял)\n" +
+  "/cancel <id> — отменить свою ставку (сам создатель или принявший, пока нет результата)\n" +
   "/mystats — моя статистика\n" +
   "/top — общий рейтинг всех участников чата\n" +
+  "/debts или /долги — кто сколько должен админу по комиссии\n" +
   "/badges или /бейджи — список всех бейджей и как их получить\n" +
   "/регламент или /правила — правила денежных матчей\n" +
   "/lineup или /составы — показать составы команд и время начала\n" +
@@ -236,7 +273,12 @@ const HELP_TEXT =
   "/result <id> creator|opponent — зафиксировать победителя\n" +
   "/del_bet <id> — удалить ставку\n" +
   "/export — выгрузить CSV с историей\n" +
-  "/set_lineup — назначить составы команд и время начала (см. шаблон ниже)\n\n" +
+  "/set_lineup — назначить составы команд и время начала (см. шаблон ниже)\n" +
+  "/set_all_usernames — задать список юзернеймов для /all вручную (см. пример ниже)\n" +
+  "/all или /все [текст] — тегнуть всех из списка (или тех, кто писал боту, если список не задан)\n" +
+  "/paid <user_id> — отметить, что участник рассчитался по комиссии (id смотреть в /debts)\n\n" +
+  "Пример /set_all_usernames:\n" +
+  "/set_all_usernames vasya, petya123, kolya_cs\n\n" +
   "ℹ️ Ответы на эти команды и сама команда приходят вам приватно и удаляются из группы " +
   "(нужно один раз нажать /start боту в личке и дать боту права админа группы " +
   "на удаление сообщений).\n\n" +
@@ -245,6 +287,22 @@ const HELP_TEXT =
 // ---------- Бот ----------
 
 const bot = new Telegraf(BOT_TOKEN);
+
+// Запоминаем каждого, кто написал боту что-либо в группе — единственный способ
+// со временем узнать реальных участников чата (см. пояснение у таблицы known_users).
+bot.use((ctx, next) => {
+  try {
+    if (ctx.from && ctx.chat && ctx.chat.type !== "private" && !ctx.from.is_bot) {
+      db.prepare(
+        `INSERT INTO known_users (chat_id, user_id, name) VALUES (?,?,?)
+         ON CONFLICT(chat_id, user_id) DO UPDATE SET name=excluded.name`
+      ).run(ctx.chat.id, ctx.from.id, userDisplayName(ctx.from));
+    }
+  } catch (e) {
+    // не критично, если не получилось — просто пропускаем
+  }
+  return next();
+});
 
 bot.command(["help", "start"], (ctx) => ctx.reply(HELP_TEXT));
 
@@ -284,6 +342,91 @@ bot.hears(/^\/регламент(?:@\w+)?(?=\s|$)/i, (ctx) =>
 bot.hears(/^\/правила(?:@\w+)?(?=\s|$)/i, (ctx) =>
   ctx.reply(REGLAMENT_TEXT, { parse_mode: "HTML" })
 );
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function normalizeUsername(u) {
+  return u.trim().replace(/^@/, "");
+}
+
+// Админ задаёт список юзернеймов вручную — надёжнее, чем ждать, пока люди
+// сами напишут боту. Каждый юзернейм на отдельной строке, с @ или без — неважно.
+bot.command("set_all_usernames", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может настраивать список для тега.");
+
+  const lines = ctx.message.text
+    .split("\n")
+    .slice(1) // первая строка — сама команда /set_all_usernames
+    .map((l) => normalizeUsername(l))
+    .filter(Boolean);
+
+  // Если список не многострочный, а через запятую в той же строке — тоже поддержим
+  const inlineArgs = ctx.message.text.split("\n")[0].split(/\s+/).slice(1).join(" ");
+  const inlineUsernames = inlineArgs
+    .split(",")
+    .map((u) => normalizeUsername(u))
+    .filter(Boolean);
+
+  const usernames = [...new Set([...lines, ...inlineUsernames])];
+
+  if (usernames.length === 0) {
+    return replyPrivately(
+      ctx,
+      "Использование — юзернеймы через запятую или каждый на новой строке, без @ или с ним:\n\n" +
+        "/set_all_usernames vasya, petya123, kolya_cs\n\n" +
+        "или:\n\n" +
+        "/set_all_usernames\nvasya\npetya123\nkolya_cs"
+    );
+  }
+
+  db.prepare(
+    `INSERT INTO tag_lists (chat_id, usernames, updated_at) VALUES (?,?,?)
+     ON CONFLICT(chat_id) DO UPDATE SET usernames=excluded.usernames, updated_at=excluded.updated_at`
+  ).run(ctx.chat.id, usernames.join("\n"), nowIso());
+
+  await replyPrivately(ctx, `✅ Список для /all сохранён: ${usernames.length} юзернейм(ов).`);
+});
+
+// Тегает всех. Приоритет — список юзернеймов, заданный вручную через
+// /set_all_usernames (надёжнее). Если он не задан — используются те, кто
+// уже успел написать боту (known_users), с тегом по id вместо @username.
+// Пример: /all Го играть через 10 минут!
+function handleTagAll(ctx) {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может тегать всех.");
+
+  const customText = ctx.message.text.split(/\s+/).slice(1).join(" ").trim();
+  const header = customText ? `📣 ${escapeHtml(customText)}\n\n` : "📣 Внимание всем:\n\n";
+
+  const tagList = db.prepare("SELECT usernames FROM tag_lists WHERE chat_id=?").get(ctx.chat.id);
+
+  let mentions;
+  if (tagList && tagList.usernames) {
+    const usernames = tagList.usernames.split("\n").filter(Boolean);
+    mentions = usernames.map((u) => `@${u}`);
+  } else {
+    const users = db.prepare("SELECT user_id, name FROM known_users WHERE chat_id=?").all(ctx.chat.id);
+    if (!users.length) {
+      return ctx.reply(
+        "Никого нет ни в списке юзернеймов, ни среди тех, кто писал боту.\n" +
+          "Задайте список вручную: /set_all_usernames vasya, petya123\n" +
+          "или дождитесь, пока люди сами напишут боту любую команду."
+      );
+    }
+    mentions = users.map((u) => `<a href="tg://user?id=${u.user_id}">${escapeHtml(u.name)}</a>`);
+  }
+
+  // На случай очень большого чата — режем на пачки по 50 упоминаний на сообщение
+  const CHUNK = 50;
+  for (let i = 0; i < mentions.length; i += CHUNK) {
+    const chunk = mentions.slice(i, i + CHUNK).join(" ");
+    ctx.reply((i === 0 ? header : "") + chunk, { parse_mode: "HTML" });
+  }
+}
+
+bot.command("all", handleTagAll);
+bot.hears(/^\/все(?:@\w+)?(?=\s|$)/i, handleTagAll);
 
 // --- Админ: лобби ---
 
@@ -399,8 +542,20 @@ bot.command("result", async (ctx) => {
 
   db.prepare("UPDATE bets SET status='settled', winner=? WHERE id=?").run(winner, betId);
 
+  const winnerId = winner === "creator" ? bet.creator_id : bet.opponent_id;
   const winnerName = winner === "creator" ? bet.creator_name : bet.opponent_name;
-  await replyPrivately(ctx, `✅ Ставка #${betId} завершена. Победитель: ${winnerName}`);
+  const commission = Math.round(bet.amount * COMMISSION_RATE * 100) / 100;
+
+  db.prepare(
+    `INSERT INTO commissions (chat_id, bet_id, user_id, user_name, amount, paid, created_at)
+     VALUES (?,?,?,?,?,0,?)`
+  ).run(ctx.chat.id, betId, winnerId, winnerName, commission, nowIso());
+
+  await replyPrivately(
+    ctx,
+    `✅ Ставка #${betId} завершена. Победитель: ${winnerName}\n` +
+      `💵 Комиссия админу (${(COMMISSION_RATE * 100).toFixed(0)}%): ${commission.toFixed(2)}$ — записана в /debts`
+  );
 });
 
 bot.command("export", async (ctx) => {
@@ -573,18 +728,32 @@ bot.command("cancel", (ctx) => {
   const bet = db.prepare("SELECT * FROM bets WHERE id=?").get(betId);
 
   if (!bet) return ctx.reply("Ставка не найдена.");
-  if (bet.creator_id !== ctx.from.id) {
-    return ctx.reply("Отменить можно только свою собственную ставку.");
+
+  const isCreator = bet.creator_id === ctx.from.id;
+  const isOpponent = bet.opponent_id === ctx.from.id;
+
+  if (!isCreator && !isOpponent) {
+    return ctx.reply("Отменить можно только ставку, в которой вы участвуете.");
   }
-  if (bet.status !== "open") {
-    return ctx.reply(
-      "Эту ставку уже нельзя отменить самому — она либо принята соперником, либо уже завершена. " +
-        "Если нужно отменить принятую ставку — обратитесь к админу."
-    );
+  if (bet.status === "settled") {
+    return ctx.reply("Эта ставка уже завершена (результат зафиксирован) — отменить нельзя. Обратитесь к админу.");
+  }
+  if (bet.status === "cancelled") {
+    return ctx.reply("Эта ставка уже отменена.");
+  }
+  if (bet.status === "open" && !isCreator) {
+    // теоретически недостижимо (opponent_id ещё не задан), но на всякий случай
+    return ctx.reply("Эту ставку ещё никто не принял — отменить может только её создатель.");
   }
 
   db.prepare("UPDATE bets SET status='cancelled' WHERE id=?").run(betId);
-  ctx.reply(`🗑 Ваша ставка #${betId} отменена.`);
+
+  const who = userDisplayName(ctx.from);
+  const otherName = isCreator ? bet.opponent_name : bet.creator_name;
+  ctx.reply(
+    `🗑 Ставка #${betId} отменена (${who}).` +
+      (otherName ? ` ${otherName}, учтите — ставка больше не действует.` : "")
+  );
 });
 
 bot.command("accept", (ctx) => {
@@ -805,6 +974,57 @@ bot.command("top", (ctx) => {
   });
 
   ctx.reply(`🏆 Общий рейтинг чата\n\n${lines.join("\n")}`);
+});
+
+function handleDebts(ctx) {
+  const rows = db
+    .prepare(
+      `SELECT user_id, user_name, SUM(amount) as total FROM commissions
+       WHERE chat_id=? AND paid=0 GROUP BY user_id ORDER BY total DESC`
+    )
+    .all(ctx.chat.id);
+
+  if (rows.length === 0) {
+    return ctx.reply("💵 Долгов по комиссии нет — все чисто.");
+  }
+
+  const lines = rows.map((r) => `• ${r.user_name} — ${r.total.toFixed(2)}$ (id: ${r.user_id})`);
+  const grandTotal = rows.reduce((sum, r) => sum + r.total, 0);
+
+  ctx.reply(
+    `💵 Долги по комиссии админу (${(COMMISSION_RATE * 100).toFixed(0)}% с выигрыша):\n\n` +
+      lines.join("\n") +
+      `\n\nИтого: ${grandTotal.toFixed(2)}$`
+  );
+}
+
+bot.command("debts", handleDebts);
+bot.hears(/^\/долги(?:@\w+)?(?=\s|$)/i, handleDebts);
+
+// Админ отмечает, что человек рассчитался — закрывает все его текущие долги по комиссии
+bot.command("paid", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может отмечать оплату.");
+
+  const args = ctx.message.text.split(/\s+/);
+  if (args.length !== 2 || !/^\d+$/.test(args[1])) {
+    return replyPrivately(
+      ctx,
+      "Использование: /paid <user_id>\nId участника видно в /debts рядом с именем."
+    );
+  }
+
+  const userId = Number(args[1]);
+  const info = db
+    .prepare(
+      `UPDATE commissions SET paid=1, paid_at=? WHERE chat_id=? AND user_id=? AND paid=0`
+    )
+    .run(nowIso(), ctx.chat.id, userId);
+
+  if (info.changes === 0) {
+    return replyPrivately(ctx, "У этого пользователя нет неоплаченных долгов.");
+  }
+
+  await replyPrivately(ctx, `✅ Долг по комиссии закрыт для id ${userId} (${info.changes} записей).`);
 });
 
 bot.command("mystats", (ctx) => {
