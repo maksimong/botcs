@@ -104,6 +104,16 @@ db.exec(`
     created_at TEXT,
     paid_at TEXT
   );
+
+  -- Запоминает, в каком групповом чате админ последний раз был активен — чтобы
+  -- админ-команды можно было писать боту в личку, а бот понимал, каким чатом
+  -- (лобби, ставками) управлять.
+  CREATE TABLE IF NOT EXISTS admin_sessions (
+    admin_id INTEGER PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    chat_title TEXT,
+    updated_at TEXT
+  );
 `);
 
 // Миграция: добавляем колонку для id закреплённого сообщения с кнопками ставок.
@@ -215,10 +225,12 @@ function isAdmin(userId) {
 // написать в личку (админ ни разу не жал /start боту) — отвечает в группе как раньше,
 // с пояснением, что нужно сделать, чтобы ответы приходили приватно.
 async function replyPrivately(ctx, text, extra) {
-  try {
-    await ctx.deleteMessage();
-  } catch (e) {
-    // бот не админ группы или не может удалить сообщение — не критично, продолжаем
+  if (ctx.chat.type !== "private") {
+    try {
+      await ctx.deleteMessage();
+    } catch (e) {
+      // бот не админ группы или не может удалить сообщение — не критично, продолжаем
+    }
   }
 
   try {
@@ -304,12 +316,17 @@ const HELP_TEXT =
   "/set_lineup — назначить составы команд и время начала (см. шаблон ниже)\n" +
   "/set_all_usernames — задать список юзернеймов для /all вручную (см. пример ниже)\n" +
   "/all или /все [текст] — тегнуть всех из списка (или тех, кто писал боту, если список не задан)\n" +
-  "/paid <user_id> — отметить, что участник рассчитался по комиссии (id смотреть в /debts)\n\n" +
+  "/paid <user_id> — отметить, что участник рассчитался по комиссии (id смотреть в /debts)\n" +
+  "/known_users — список всех, кого бот знает в чате (для отладки /add_bet и /edit_bet)\n\n" +
   "Пример /set_all_usernames:\n" +
   "/set_all_usernames vasya, petya123, kolya_cs\n\n" +
   "ℹ️ Ответы на эти команды и сама команда приходят вам приватно и удаляются из группы " +
   "(нужно один раз нажать /start боту в личке и дать боту права админа группы " +
   "на удаление сообщений).\n\n" +
+  "ℹ️ /add_bet, /edit_bet и /del_bet можно писать боту и напрямую в личку, без захода в группу — " +
+  "бот сам поймёт, какой чат вести, если вы хоть раз писали админ-команду в самой группе. " +
+  "Ответ в этом случае придёт только в личку, в группу бот ничего не напишет. Остальные " +
+  "админ-команды работают только в самом групповом чате.\n\n" +
   LINEUP_TEMPLATE;
 
 // ---------- Бот ----------
@@ -318,6 +335,8 @@ const bot = new Telegraf(BOT_TOKEN);
 
 // Запоминаем каждого, кто написал боту что-либо в группе — единственный способ
 // со временем узнать реальных участников чата (см. пояснение у таблицы known_users).
+// Заодно, если пишет админ, запоминаем этот чат как его "рабочий" — понадобится,
+// чтобы админ-команды работали и в личке с ботом.
 bot.use((ctx, next) => {
   try {
     if (ctx.from && ctx.chat && ctx.chat.type !== "private" && !ctx.from.is_bot) {
@@ -325,12 +344,46 @@ bot.use((ctx, next) => {
         `INSERT INTO known_users (chat_id, user_id, name, username) VALUES (?,?,?,?)
          ON CONFLICT(chat_id, user_id) DO UPDATE SET name=excluded.name, username=excluded.username`
       ).run(ctx.chat.id, ctx.from.id, userDisplayName(ctx.from), ctx.from.username || null);
+
+      if (isAdmin(ctx.from.id)) {
+        db.prepare(
+          `INSERT INTO admin_sessions (admin_id, chat_id, chat_title, updated_at) VALUES (?,?,?,?)
+           ON CONFLICT(admin_id) DO UPDATE SET chat_id=excluded.chat_id, chat_title=excluded.chat_title, updated_at=excluded.updated_at`
+        ).run(ctx.from.id, ctx.chat.id, ctx.chat.title || null, nowIso());
+      }
     }
   } catch (e) {
     // не критично, если не получилось — просто пропускаем
   }
   return next();
 });
+
+// Определяет, каким групповым чатом управлять. В группе — это сам этот чат.
+// В личке с ботом — последний групповой чат, где этот админ был активен.
+// Возвращает null, если это личка и бот ещё не знает ни одного чата для этого админа.
+function resolveManagedChatId(ctx) {
+  if (ctx.chat.type !== "private") return ctx.chat.id;
+  const row = db.prepare("SELECT chat_id FROM admin_sessions WHERE admin_id=?").get(ctx.from.id);
+  return row ? row.chat_id : null;
+}
+
+const NO_MANAGED_CHAT_MSG =
+  "Бот пока не знает, каким чатом управлять из личных сообщений. " +
+  "Напишите любую админ-команду прямо в групповом чате хотя бы один раз — " +
+  "после этого бот запомнит этот чат, и все команды заработают и в личке тоже.";
+
+// Из личных сообщений с ботом можно только добавлять/редактировать/удалять ставки
+// (/add_bet, /edit_bet, /del_bet). Все остальные админ-команды — только в группе.
+function requireGroupChat(ctx) {
+  if (ctx.chat.type === "private") {
+    ctx.reply(
+      "Эта команда работает только в самом групповом чате — напишите её там. " +
+        "В личке доступны только /add_bet, /edit_bet и /del_bet."
+    );
+    return null;
+  }
+  return ctx.chat.id;
+}
 
 bot.command(["help", "start"], (ctx) => ctx.reply(HELP_TEXT));
 
@@ -383,6 +436,8 @@ function normalizeUsername(u) {
 // сами напишут боту. Каждый юзернейм на отдельной строке, с @ или без — неважно.
 bot.command("set_all_usernames", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может настраивать список для тега.");
+  const chatId = requireGroupChat(ctx);
+  if (!chatId) return;
 
   const lines = ctx.message.text
     .split("\n")
@@ -412,7 +467,7 @@ bot.command("set_all_usernames", async (ctx) => {
   db.prepare(
     `INSERT INTO tag_lists (chat_id, usernames, updated_at) VALUES (?,?,?)
      ON CONFLICT(chat_id) DO UPDATE SET usernames=excluded.usernames, updated_at=excluded.updated_at`
-  ).run(ctx.chat.id, usernames.join("\n"), nowIso());
+  ).run(chatId, usernames.join("\n"), nowIso());
 
   await replyPrivately(ctx, `✅ Список для /all сохранён: ${usernames.length} юзернейм(ов).`);
 });
@@ -423,18 +478,20 @@ bot.command("set_all_usernames", async (ctx) => {
 // Пример: /all Го играть через 10 минут!
 function handleTagAll(ctx) {
   if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может тегать всех.");
+  const chatId = requireGroupChat(ctx);
+  if (!chatId) return;
 
   const customText = ctx.message.text.split(/\s+/).slice(1).join(" ").trim();
   const header = customText ? `📣 ${escapeHtml(customText)}\n\n` : "📣 Внимание всем:\n\n";
 
-  const tagList = db.prepare("SELECT usernames FROM tag_lists WHERE chat_id=?").get(ctx.chat.id);
+  const tagList = db.prepare("SELECT usernames FROM tag_lists WHERE chat_id=?").get(chatId);
 
   let mentions;
   if (tagList && tagList.usernames) {
     const usernames = tagList.usernames.split("\n").filter(Boolean);
     mentions = usernames.map((u) => `@${u}`);
   } else {
-    const users = db.prepare("SELECT user_id, name FROM known_users WHERE chat_id=?").all(ctx.chat.id);
+    const users = db.prepare("SELECT user_id, name FROM known_users WHERE chat_id=?").all(chatId);
     if (!users.length) {
       return ctx.reply(
         "Никого нет ни в списке юзернеймов, ни среди тех, кто писал боту.\n" +
@@ -445,23 +502,53 @@ function handleTagAll(ctx) {
     mentions = users.map((u) => `<a href="tg://user?id=${u.user_id}">${escapeHtml(u.name)}</a>`);
   }
 
-  // На случай очень большого чата — режем на пачки по 50 упоминаний на сообщение
+  // Тег всегда идёт в групповой чат, даже если команда пришла из личных сообщений —
+  // иначе теряется весь смысл тега.
   const CHUNK = 50;
   for (let i = 0; i < mentions.length; i += CHUNK) {
     const chunk = mentions.slice(i, i + CHUNK).join(" ");
-    ctx.reply((i === 0 ? header : "") + chunk, { parse_mode: "HTML" });
+    ctx.telegram.sendMessage(chatId, (i === 0 ? header : "") + chunk, { parse_mode: "HTML" });
+  }
+
+  if (ctx.chat.type === "private") {
+    ctx.reply("✅ Отправлено в чат.");
   }
 }
 
 bot.command("all", handleTagAll);
 bot.hears(/^\/все(?:@\w+)?(?=\s|$)/i, handleTagAll);
 
+// Диагностика: показывает всех, кого бот реально запомнил в этом чате — с id и
+// юзернеймом (если есть). Помогает понять, почему /add_bet или /edit_bet не находят
+// человека по @username.
+bot.command("known_users", (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может это смотреть.");
+  const chatId = requireGroupChat(ctx);
+  if (!chatId) return;
+
+  const users = db
+    .prepare("SELECT user_id, name, username FROM known_users WHERE chat_id=? ORDER BY name")
+    .all(chatId);
+
+  if (users.length === 0) {
+    return ctx.reply("Бот пока никого не запомнил в этом чате.");
+  }
+
+  const lines = users.map(
+    (u) => `• ${u.name} — id: ${u.user_id}${u.username ? `, @${u.username}` : " (юзернейма нет)"}`
+  );
+
+  ctx.reply(`👥 Известные боту участники (${users.length}):\n\n${lines.join("\n")}`);
+});
+
 // --- Админ: лобби ---
 
 bot.command("create_lobby", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может создавать лобби.");
+  const chatId = requireGroupChat(ctx);
+  if (!chatId) return;
 
-  const existing = getActiveLobby(ctx.chat.id);
+  const existing = getActiveLobby(chatId);
   if (existing) {
     return replyPrivately(
       ctx,
@@ -473,7 +560,7 @@ bot.command("create_lobby", async (ctx) => {
     .prepare(
       "INSERT INTO lobbies (chat_id, title, status, created_by, created_at) VALUES (?,?,?,?,?)"
     )
-    .run(ctx.chat.id, "", "open", ctx.from.id, nowIso());
+    .run(chatId, "", "open", ctx.from.id, nowIso());
 
   await replyPrivately(
     ctx,
@@ -482,7 +569,7 @@ bot.command("create_lobby", async (ctx) => {
 
   // Публичное объявление для всех — без деталей, просто что приём ставок открыт
   const announcement = await ctx.telegram.sendMessage(
-    ctx.chat.id,
+    chatId,
     `✅ Приём ставок открыт!\nСтавьте командой /bet <сумма> или кнопками ниже 👇`,
     quickBetKeyboard()
   );
@@ -490,7 +577,7 @@ bot.command("create_lobby", async (ctx) => {
   // Закрепляем сообщение, чтобы кнопки было легко найти даже после того, как чат
   // уйдёт далеко вперёд. Если у бота нет прав на закрепление — просто пропускаем.
   try {
-    await ctx.telegram.pinChatMessage(ctx.chat.id, announcement.message_id, {
+    await ctx.telegram.pinChatMessage(chatId, announcement.message_id, {
       disable_notification: true,
     });
     db.prepare("UPDATE lobbies SET pinned_message_id=? WHERE id=?").run(
@@ -504,8 +591,10 @@ bot.command("create_lobby", async (ctx) => {
 
 bot.command("close_lobby", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может закрывать лобби.");
+  const chatId = requireGroupChat(ctx);
+  if (!chatId) return;
 
-  const lobby = getActiveLobby(ctx.chat.id);
+  const lobby = getActiveLobby(chatId);
   if (!lobby) return replyPrivately(ctx, "Нет открытого лобби.");
 
   db.prepare("UPDATE lobbies SET status='closed', closed_at=? WHERE id=?").run(
@@ -522,13 +611,13 @@ bot.command("close_lobby", async (ctx) => {
   // Открепляем сообщение с кнопками ставок, если оно было закреплено
   if (lobby.pinned_message_id) {
     try {
-      await ctx.telegram.unpinChatMessage(ctx.chat.id, { message_id: lobby.pinned_message_id });
+      await ctx.telegram.unpinChatMessage(chatId, { message_id: lobby.pinned_message_id });
     } catch (e) {
       // не критично, если не получилось
     }
   }
 
-  await ctx.telegram.sendMessage(ctx.chat.id, `🔒 Приём ставок закрыт!`);
+  await ctx.telegram.sendMessage(chatId, `🔒 Приём ставок закрыт!`);
 });
 
 bot.command("del_bet", async (ctx) => {
@@ -552,6 +641,8 @@ bot.command("del_bet", async (ctx) => {
 // числовой id. Создаётся сразу как "matched" — результат потом через /result.
 bot.command("add_bet", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может добавлять ставки за игроков.");
+  const chatId = resolveManagedChatId(ctx);
+  if (!chatId) return ctx.reply(NO_MANAGED_CHAT_MSG);
 
   const args = ctx.message.text.split(/\s+/);
   if (args.length !== 4) {
@@ -569,11 +660,11 @@ bot.command("add_bet", async (ctx) => {
     return replyPrivately(ctx, "Сумма должна быть положительным числом.");
   }
 
-  const lobby = getActiveLobby(ctx.chat.id);
+  const lobby = getActiveLobby(chatId);
   if (!lobby) return replyPrivately(ctx, "Нет открытого лобби — сначала /create_lobby.");
 
-  const p1 = resolveUser(ctx.chat.id, p1raw);
-  const p2 = resolveUser(ctx.chat.id, p2raw);
+  const p1 = resolveUser(chatId, p1raw);
+  const p2 = resolveUser(chatId, p2raw);
 
   if (!p1 || !p2) {
     return replyPrivately(
@@ -639,12 +730,16 @@ bot.command("edit_bet", async (ctx) => {
     return replyPrivately(ctx, `✅ Ставка #${betId}: сумма изменена на ${amount.toFixed(2)}$.`);
   }
 
-  const player = resolveUser(ctx.chat.id, value);
+  const player = (() => {
+    const chatId = resolveManagedChatId(ctx);
+    return chatId ? resolveUser(chatId, value) : null;
+  })();
   if (!player) {
     return replyPrivately(
       ctx,
       "Не удалось определить игрока по юзернейму. Попросите его написать боту что угодно один раз, " +
-        "либо укажите числовой id напрямую."
+        "либо укажите числовой id напрямую. Если вы пишете из личных сообщений — сначала напишите " +
+        "любую команду в самом групповом чате, чтобы бот понимал, какой чат искать."
     );
   }
 
@@ -681,6 +776,8 @@ bot.command("result", async (ctx) => {
     return replyPrivately(ctx, "Результат можно зафиксировать только для сматченной ставки.");
   }
 
+  const lobbyForBet = db.prepare("SELECT chat_id FROM lobbies WHERE id=?").get(bet.lobby_id);
+
   db.prepare("UPDATE bets SET status='settled', winner=? WHERE id=?").run(winner, betId);
 
   const winnerId = winner === "creator" ? bet.creator_id : bet.opponent_id;
@@ -690,7 +787,7 @@ bot.command("result", async (ctx) => {
   db.prepare(
     `INSERT INTO commissions (chat_id, bet_id, user_id, user_name, amount, paid, created_at)
      VALUES (?,?,?,?,?,0,?)`
-  ).run(ctx.chat.id, betId, winnerId, winnerName, commission, nowIso());
+  ).run(lobbyForBet.chat_id, betId, winnerId, winnerName, commission, nowIso());
 
   await replyPrivately(
     ctx,
@@ -701,6 +798,8 @@ bot.command("result", async (ctx) => {
 
 bot.command("export", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может выгружать историю.");
+  const chatId = requireGroupChat(ctx);
+  if (!chatId) return;
 
   const rows = db
     .prepare(
@@ -708,7 +807,7 @@ bot.command("export", async (ctx) => {
        JOIN lobbies l ON l.id = b.lobby_id
        WHERE l.chat_id=? ORDER BY b.id`
     )
-    .all(ctx.chat.id);
+    .all(chatId);
 
   const header = "bet_id,lobby_id,creator,opponent,amount,status,winner,created_at,matched_at\n";
   const csvEscape = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
@@ -732,10 +831,12 @@ bot.command("export", async (ctx) => {
 
   const csv = "\uFEFF" + header + body; // BOM для корректной кириллицы в Excel
 
-  try {
-    await ctx.deleteMessage();
-  } catch (e) {
-    // не критично, если не получилось
+  if (ctx.chat.type !== "private") {
+    try {
+      await ctx.deleteMessage();
+    } catch (e) {
+      // не критично, если не получилось
+    }
   }
 
   try {
@@ -755,6 +856,8 @@ bot.command("export", async (ctx) => {
 
 bot.command("set_lineup", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может назначать составы.");
+  const chatId = requireGroupChat(ctx);
+  if (!chatId) return;
 
   const lines = ctx.message.text.split("\n");
   if (lines.length < 12) return replyPrivately(ctx, LINEUP_TEMPLATE);
@@ -770,7 +873,7 @@ bot.command("set_lineup", async (ctx) => {
   db.prepare(
     `INSERT INTO lineups (chat_id, match_time, team1, team2, created_by, created_at)
      VALUES (?,?,?,?,?,?)`
-  ).run(ctx.chat.id, matchTime, team1.join("\n"), team2.join("\n"), ctx.from.id, nowIso());
+  ).run(chatId, matchTime, team1.join("\n"), team2.join("\n"), ctx.from.id, nowIso());
 
   await replyPrivately(ctx, "✅ Составы обновлены. Посмотреть: /lineup или /составы");
 });
@@ -1145,6 +1248,8 @@ bot.hears(/^\/долги(?:@\w+)?(?=\s|$)/i, handleDebts);
 // Админ отмечает, что человек рассчитался — закрывает все его текущие долги по комиссии
 bot.command("paid", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может отмечать оплату.");
+  const chatId = requireGroupChat(ctx);
+  if (!chatId) return;
 
   const args = ctx.message.text.split(/\s+/);
   if (args.length !== 2 || !/^\d+$/.test(args[1])) {
@@ -1159,7 +1264,7 @@ bot.command("paid", async (ctx) => {
     .prepare(
       `UPDATE commissions SET paid=1, paid_at=? WHERE chat_id=? AND user_id=? AND paid=0`
     )
-    .run(nowIso(), ctx.chat.id, userId);
+    .run(nowIso(), chatId, userId);
 
   if (info.changes === 0) {
     return replyPrivately(ctx, "У этого пользователя нет неоплаченных долгов.");
