@@ -114,6 +114,14 @@ try {
   // колонка уже существует — это нормально
 }
 
+// Миграция: username нужен, чтобы админ мог добавлять/редактировать ставки за
+// игроков по @юзернейму, а не только по числовому id.
+try {
+  db.exec("ALTER TABLE known_users ADD COLUMN username TEXT");
+} catch (e) {
+  // колонка уже существует — это нормально
+}
+
 // ---------- Общая логика ставок (используется и командами, и кнопками) ----------
 
 const QUICK_AMOUNTS = [50, 100, 200, 500];
@@ -174,6 +182,24 @@ function acceptBet(betId, userId, userName) {
 
 function userDisplayName(from) {
   return from.first_name || from.username || "Игрок";
+}
+
+// Находит игрока по @username или числовому telegram id — используется в
+// админских командах /add_bet и /edit_bet, где нужно указать конкретного человека
+// без того, чтобы он сам писал команду в момент создания ставки.
+function resolveUser(chatId, identifier) {
+  if (/^\d+$/.test(identifier)) {
+    const id = Number(identifier);
+    const row = db.prepare("SELECT name FROM known_users WHERE chat_id=? AND user_id=?").get(chatId, id);
+    return { id, name: row ? row.name : `Игрок ${id}` };
+  }
+
+  const username = identifier.replace(/^@/, "").toLowerCase();
+  const row = db
+    .prepare("SELECT user_id, name FROM known_users WHERE chat_id=? AND LOWER(username)=?")
+    .get(chatId, username);
+
+  return row ? { id: row.user_id, name: row.name } : null;
 }
 
 function nowIso() {
@@ -272,6 +298,8 @@ const HELP_TEXT =
   "/close_lobby — закрыть приём ставок\n" +
   "/result <id> creator|opponent — зафиксировать победителя\n" +
   "/del_bet <id> — удалить ставку\n" +
+  "/add_bet <игрок1> <игрок2> <сумма> — добавить ставку вручную (@username или id)\n" +
+  "/edit_bet <id> amount|creator|opponent <значение> — отредактировать ставку\n" +
   "/export — выгрузить CSV с историей\n" +
   "/set_lineup — назначить составы команд и время начала (см. шаблон ниже)\n" +
   "/set_all_usernames — задать список юзернеймов для /all вручную (см. пример ниже)\n" +
@@ -294,9 +322,9 @@ bot.use((ctx, next) => {
   try {
     if (ctx.from && ctx.chat && ctx.chat.type !== "private" && !ctx.from.is_bot) {
       db.prepare(
-        `INSERT INTO known_users (chat_id, user_id, name) VALUES (?,?,?)
-         ON CONFLICT(chat_id, user_id) DO UPDATE SET name=excluded.name`
-      ).run(ctx.chat.id, ctx.from.id, userDisplayName(ctx.from));
+        `INSERT INTO known_users (chat_id, user_id, name, username) VALUES (?,?,?,?)
+         ON CONFLICT(chat_id, user_id) DO UPDATE SET name=excluded.name, username=excluded.username`
+      ).run(ctx.chat.id, ctx.from.id, userDisplayName(ctx.from), ctx.from.username || null);
     }
   } catch (e) {
     // не критично, если не получилось — просто пропускаем
@@ -517,6 +545,119 @@ bot.command("del_bet", async (ctx) => {
 
   db.prepare("UPDATE bets SET status='cancelled' WHERE id=?").run(betId);
   await replyPrivately(ctx, `🗑 Ставка #${betId} удалена (отменена).`);
+});
+
+// Админ добавляет ставку вручную (например, если игроки договорились прямо во
+// время игры, минуя /bet и /accept). Игрок указывается через @username или
+// числовой id. Создаётся сразу как "matched" — результат потом через /result.
+bot.command("add_bet", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может добавлять ставки за игроков.");
+
+  const args = ctx.message.text.split(/\s+/);
+  if (args.length !== 4) {
+    return replyPrivately(
+      ctx,
+      "Использование: /add_bet <игрок1> <игрок2> <сумма>\n" +
+        "Игрок — @username или числовой id (id узнать через /debts, если человек уже писал боту).\n" +
+        "Пример: /add_bet @vasya @petya 100"
+    );
+  }
+
+  const [, p1raw, p2raw, amountRaw] = args;
+  const amount = parseFloat(amountRaw.replace(",", "."));
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return replyPrivately(ctx, "Сумма должна быть положительным числом.");
+  }
+
+  const lobby = getActiveLobby(ctx.chat.id);
+  if (!lobby) return replyPrivately(ctx, "Нет открытого лобби — сначала /create_lobby.");
+
+  const p1 = resolveUser(ctx.chat.id, p1raw);
+  const p2 = resolveUser(ctx.chat.id, p2raw);
+
+  if (!p1 || !p2) {
+    return replyPrivately(
+      ctx,
+      "Не удалось определить одного из игроков по юзернейму. " +
+        "Попросите его один раз написать боту что угодно (например /help) — после этого бот его узнает, " +
+        "либо укажите числовой id напрямую."
+    );
+  }
+  if (p1.id === p2.id) return replyPrivately(ctx, "Игроки должны быть разными.");
+
+  const info = db
+    .prepare(
+      `INSERT INTO bets (lobby_id, creator_id, creator_name, amount, status, opponent_id, opponent_name, matched_at, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?)`
+    )
+    .run(lobby.id, p1.id, p1.name, amount, "matched", p2.id, p2.name, nowIso(), nowIso());
+
+  await replyPrivately(
+    ctx,
+    `✅ Ставка #${info.lastInsertRowid} добавлена вручную: ${p1.name} vs ${p2.name}, ${amount.toFixed(2)}$.\n` +
+      `Когда узнаете исход: /result ${info.lastInsertRowid} creator|opponent`
+  );
+});
+
+// Редактирование уже существующей ставки — сумма или один из участников
+// (пригодится, когда игроки переделили ставки между собой прямо во время игры).
+bot.command("edit_bet", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("Только админ может редактировать ставки.");
+
+  const args = ctx.message.text.split(/\s+/);
+  if (args.length !== 4 || !/^\d+$/.test(args[1]) || !["amount", "creator", "opponent"].includes(args[2])) {
+    return replyPrivately(
+      ctx,
+      "Использование: /edit_bet <bet_id> <amount|creator|opponent> <новое значение>\n\n" +
+        "Примеры:\n" +
+        "/edit_bet 7 amount 150\n" +
+        "/edit_bet 7 creator @vasya\n" +
+        "/edit_bet 7 opponent 123456789"
+    );
+  }
+
+  const betId = Number(args[1]);
+  const field = args[2];
+  const value = args[3];
+
+  const bet = db.prepare("SELECT * FROM bets WHERE id=?").get(betId);
+  if (!bet) return replyPrivately(ctx, "Ставка не найдена.");
+  if (bet.status === "settled") {
+    return replyPrivately(
+      ctx,
+      "Эта ставка уже завершена (результат зафиксирован) — редактировать нельзя. " +
+        "Можно удалить (/del_bet) и добавить заново (/add_bet)."
+    );
+  }
+
+  if (field === "amount") {
+    const amount = parseFloat(value.replace(",", "."));
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return replyPrivately(ctx, "Сумма должна быть положительным числом.");
+    }
+    db.prepare("UPDATE bets SET amount=? WHERE id=?").run(amount, betId);
+    return replyPrivately(ctx, `✅ Ставка #${betId}: сумма изменена на ${amount.toFixed(2)}$.`);
+  }
+
+  const player = resolveUser(ctx.chat.id, value);
+  if (!player) {
+    return replyPrivately(
+      ctx,
+      "Не удалось определить игрока по юзернейму. Попросите его написать боту что угодно один раз, " +
+        "либо укажите числовой id напрямую."
+    );
+  }
+
+  if (field === "creator") {
+    db.prepare("UPDATE bets SET creator_id=?, creator_name=? WHERE id=?").run(player.id, player.name, betId);
+  } else {
+    db.prepare("UPDATE bets SET opponent_id=?, opponent_name=? WHERE id=?").run(player.id, player.name, betId);
+  }
+
+  await replyPrivately(
+    ctx,
+    `✅ Ставка #${betId}: ${field === "creator" ? "создатель" : "принявший"} изменён на ${player.name}.`
+  );
 });
 
 bot.command("result", async (ctx) => {
